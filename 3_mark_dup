@@ -1,0 +1,166 @@
+#!/bin/bash
+
+#===============================================
+# IMPROVED MARKDUPLICATES PIPELINE
+# Includes proper indexing and validation
+#===============================================
+
+# Configuration
+ALIGNED_READS="alignment"
+OUTPUT_DIR="${ALIGNED_READS}/marked"
+LOG_DIR="logs/markduplicates"
+THREADS=32
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
+
+echo "=========================================="
+echo "MarkDuplicates Pipeline with Indexing"
+echo "=========================================="
+echo "Input directory: $ALIGNED_READS"
+echo "Output directory: $OUTPUT_DIR"
+echo "=========================================="
+echo ""
+
+# Check GATK is available
+if ! command -v gatk &> /dev/null; then
+    echo "ERROR: GATK not found in PATH"
+    exit 1
+fi
+
+# Count files
+TOTAL=$(ls ${ALIGNED_READS}/*.bam 2>/dev/null | wc -l)
+
+if [[ $TOTAL -eq 0 ]]; then
+    echo "ERROR: No BAM files found in $ALIGNED_READS"
+    exit 1
+fi
+
+echo "Found $TOTAL BAM files to process"
+echo ""
+
+PROCESSED=0
+FAILED=0
+SKIPPED=0
+
+# Process each BAM file
+for BAM in ${ALIGNED_READS}/*.bam; do
+    
+    BASE_NAME=$(basename "$BAM" .bam)
+    OUTPUT_BAM="${OUTPUT_DIR}/${BASE_NAME}_marked.bam"
+    METRICS="${OUTPUT_DIR}/${BASE_NAME}_metrics.txt"
+    LOG="${LOG_DIR}/${BASE_NAME}.log"
+    
+    # Skip if already processed and indexed
+    if [[ -f "${OUTPUT_BAM}.bai" ]]; then
+        # Verify the BAM is OK
+        samtools quickcheck "$OUTPUT_BAM" 2>/dev/null
+        if [[ $? -eq 0 ]]; then
+            echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $BASE_NAME - SKIPPED (already processed)"
+            ((SKIPPED++))
+            continue
+        else
+            echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $BASE_NAME - Re-processing (previous file corrupted)"
+            rm -f "$OUTPUT_BAM" "${OUTPUT_BAM}.bai"
+        fi
+    fi
+    
+    echo "=========================================="
+    echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] Processing: $BASE_NAME"
+    echo "=========================================="
+    START_TIME=$(date +%s)
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    
+    # Run MarkDuplicates
+    echo "Running MarkDuplicates..."
+    gatk MarkDuplicates \
+        -I "$BAM" \
+        -O "$OUTPUT_BAM" \
+        -M "$METRICS" \
+        --CREATE_INDEX true \
+        --VALIDATION_STRINGENCY LENIENT \
+        2>&1 | tee "$LOG"
+    
+    GATK_EXIT=${PIPESTATUS[0]}
+    
+    if [[ $GATK_EXIT -ne 0 ]]; then
+        echo "❌ ERROR: MarkDuplicates failed!"
+        echo "Check log: $LOG"
+        tail -20 "$LOG"
+        ((FAILED++))
+        rm -f "$OUTPUT_BAM" "${OUTPUT_BAM}.bai"
+        continue
+    fi
+    
+    echo "MarkDuplicates completed"
+    echo ""
+    
+    # Verify output
+    echo "Verifying output..."
+    samtools quickcheck "$OUTPUT_BAM" 2>/dev/null
+    
+    if [[ $? -ne 0 ]]; then
+        echo "⚠️  WARNING: Output BAM failed validation, attempting to fix..."
+        
+        # Try to fix by reindexing
+        rm -f "${OUTPUT_BAM}.bai"
+        samtools index -@ $THREADS "$OUTPUT_BAM" 2>/dev/null
+        
+        samtools quickcheck "$OUTPUT_BAM" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            echo "❌ ERROR: Cannot fix BAM file"
+            ((FAILED++))
+            continue
+        fi
+    fi
+    
+    # Ensure index exists
+    if [[ ! -f "${OUTPUT_BAM}.bai" ]]; then
+        echo "Creating BAM index..."
+        samtools index -@ $THREADS "$OUTPUT_BAM"
+        
+        if [[ $? -ne 0 ]]; then
+            echo "❌ ERROR: Failed to create index"
+            ((FAILED++))
+            continue
+        fi
+    fi
+    
+    # Calculate statistics
+    echo "Calculating statistics..."
+    TOTAL_READS=$(samtools view -c "$OUTPUT_BAM" 2>/dev/null)
+    DUPLICATES=$(grep "^LIBRARY" -A 1 "$METRICS" | tail -1 | awk '{print $7}')
+    
+    END_TIME=$(date +%s)
+    RUNTIME=$((END_TIME - START_TIME))
+    
+    echo "✅ SUCCESS: $BASE_NAME"
+    echo "  Total reads: $TOTAL_READS"
+    echo "  Duplicate reads: $DUPLICATES"
+    echo "  Runtime: $((RUNTIME / 60)) minutes"
+    echo "Completed: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    
+    ((PROCESSED++))
+    
+done
+
+# Final summary
+echo "=========================================="
+echo "MARKDUPLICATES PIPELINE COMPLETED"
+echo "=========================================="
+echo "Total samples: $TOTAL"
+echo "Successfully processed: $PROCESSED"
+echo "Skipped (already done): $SKIPPED"
+echo "Failed: $FAILED"
+echo ""
+echo "Results saved to: $OUTPUT_DIR"
+echo "Logs saved to: $LOG_DIR"
+echo "=========================================="
+
+if [[ $FAILED -gt 0 ]]; then
+    echo "⚠️  WARNING: $FAILED samples failed. Check logs in $LOG_DIR"
+fi
+
+exit 0

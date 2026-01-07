@@ -1,0 +1,229 @@
+#!/bin/bash
+
+#===============================================
+# BWA-MEM ALIGNMENT PIPELINE FOR PAIRED-END READS
+#===============================================
+
+# Configuration
+REFERENCE="references/genome.fa"
+FASTQ_DIR="GWAS/fastq_files"
+OUTPUT_DIR="alignment"
+THREADS=32
+LOG_DIR="logs"
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
+
+echo "=========================================="
+echo "BWA-MEM Alignment Pipeline"
+echo "=========================================="
+echo "Reference: $REFERENCE"
+echo "Input directory: $FASTQ_DIR"
+echo "Output directory: $OUTPUT_DIR"
+echo "Threads: $THREADS"
+echo "=========================================="
+echo ""
+
+# Check reference exists
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: Reference genome not found at $REFERENCE"
+    exit 1
+fi
+
+# Check BWA index exists
+if [[ ! -f "${REFERENCE}.bwt" ]]; then
+    echo "ERROR: BWA index not found. Please run: bwa index $REFERENCE"
+    exit 1
+fi
+
+# Count samples
+TOTAL=$(ls ${FASTQ_DIR}/*_R1.fastq.gz 2>/dev/null | wc -l)
+if [[ $TOTAL -eq 0 ]]; then
+    echo "ERROR: No *_R1.fastq.gz files found in $FASTQ_DIR"
+    exit 1
+fi
+
+echo "Found $TOTAL samples to process"
+echo ""
+
+# Initialize counters and metadata file
+PROCESSED=0
+FAILED=0
+SKIPPED=0
+METADATA="${LOG_DIR}/alignment_summary.csv"
+echo "Sample,TotalReads,MappedReads,MappingRate,Status" > "$METADATA"
+
+# Process each sample
+for R1 in ${FASTQ_DIR}/*_R1.fastq.gz; do
+    
+    # Get sample name
+    SAMPLE=$(basename "$R1" | sed 's/_R1.fastq.gz//')
+    R2="${FASTQ_DIR}/${SAMPLE}_R2.fastq.gz"
+    
+    # Check R2 exists
+    if [[ ! -f "$R2" ]]; then
+        echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $SAMPLE - ERROR: R2 file not found"
+        ((FAILED++))
+        echo "$SAMPLE,0,0,0,FAILED_NO_R2" >> "$METADATA"
+        continue
+    fi
+    
+    BAM="${OUTPUT_DIR}/${SAMPLE}.bam"
+    LOG="${LOG_DIR}/${SAMPLE}.log"
+    
+    # Skip if already processed
+    if [[ -f "${BAM}.bai" ]]; then
+        echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $SAMPLE - SKIPPED (already processed)"
+        ((SKIPPED++))
+        continue
+    fi
+    
+    echo "=========================================="
+    echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] Processing: $SAMPLE"
+    echo "=========================================="
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    # Extract read group information from FASTQ header
+    echo "Extracting metadata from FASTQ header..."
+    HEADER=$(zcat "$R1" | head -1)
+    echo "Header: $HEADER"
+    
+    # Parse Illumina header format
+    INSTRUMENT=$(echo "$HEADER" | awk '{print $2}' | awk -F: '{print $1}')
+    FLOWCELL=$(echo "$HEADER" | awk '{print $2}' | awk -F: '{print $3}')
+    LANE=$(echo "$HEADER" | awk '{print $2}' | awk -F: '{print $4}')
+    
+    # Build read group string
+    RG="@RG\tID:${SAMPLE}_${FLOWCELL}_${LANE}\tSM:${SAMPLE}\tPL:ILLUMINA\tLB:${SAMPLE}_lib\tPU:${FLOWCELL}.${LANE}"
+    
+    echo "Read Group: SM=$SAMPLE, PU=${FLOWCELL}.${LANE}"
+    echo ""
+    
+    # STEP 1: Run BWA-MEM
+    echo "[1/4] Running BWA-MEM alignment..."
+    echo "Command: bwa mem -t $THREADS -R \"$RG\" $REFERENCE $R1 $R2"
+    echo "This will take 15-30 minutes per sample..."
+    echo "Log file: $LOG"
+    echo ""
+    
+    # Run BWA-MEM and save output directly to BAM
+    bwa mem -t $THREADS -R "$RG" "$REFERENCE" "$R1" "$R2" > "${LOG_DIR}/${SAMPLE}.sam" 2> "$LOG"
+    BWA_EXIT=$?
+    
+    echo "BWA-MEM exit code: $BWA_EXIT"
+    
+    if [[ $BWA_EXIT -ne 0 ]]; then
+        echo "ERROR: BWA-MEM failed!"
+        echo "Check log file: $LOG"
+        tail -20 "$LOG"
+        ((FAILED++))
+        echo "$SAMPLE,0,0,0,FAILED_BWA" >> "$METADATA"
+        rm -f "${LOG_DIR}/${SAMPLE}.sam"
+        continue
+    fi
+    
+    echo "BWA-MEM completed successfully"
+    echo ""
+    
+    # STEP 2: Convert SAM to BAM
+    echo "[2/4] Converting SAM to BAM..."
+    samtools view -@ $THREADS -b -o "$BAM" "${LOG_DIR}/${SAMPLE}.sam"
+    SAM_EXIT=$?
+    
+    echo "Samtools view exit code: $SAM_EXIT"
+    
+    if [[ $SAM_EXIT -ne 0 ]]; then
+        echo "ERROR: SAM to BAM conversion failed!"
+        ((FAILED++))
+        echo "$SAMPLE,0,0,0,FAILED_SAMTOOLS" >> "$METADATA"
+        rm -f "$BAM" "${LOG_DIR}/${SAMPLE}.sam"
+        continue
+    fi
+    
+    # Remove SAM file to save space
+    rm -f "${LOG_DIR}/${SAMPLE}.sam"
+    echo "SAM to BAM conversion completed"
+    echo ""
+    
+    # STEP 3: Sort BAM
+    echo "[3/4] Sorting BAM file..."
+    samtools sort -@ $THREADS -o "${BAM}.sorted" "$BAM"
+    SORT_EXIT=$?
+    
+    echo "Samtools sort exit code: $SORT_EXIT"
+    
+    if [[ $SORT_EXIT -ne 0 ]]; then
+        echo "ERROR: BAM sorting failed!"
+        ((FAILED++))
+        echo "$SAMPLE,0,0,0,FAILED_SORT" >> "$METADATA"
+        rm -f "$BAM" "${BAM}.sorted"
+        continue
+    fi
+    
+    mv "${BAM}.sorted" "$BAM"
+    echo "BAM sorting completed"
+    echo ""
+    
+    # STEP 4: Index BAM
+    echo "[4/4] Indexing BAM file..."
+    samtools index -@ $THREADS "$BAM"
+    INDEX_EXIT=$?
+    
+    echo "Samtools index exit code: $INDEX_EXIT"
+    
+    if [[ $INDEX_EXIT -ne 0 ]]; then
+        echo "ERROR: BAM indexing failed!"
+        ((FAILED++))
+        echo "$SAMPLE,0,0,0,FAILED_INDEX" >> "$METADATA"
+        continue
+    fi
+    
+    echo "BAM indexing completed"
+    echo ""
+    
+    # STEP 5: Calculate statistics
+    echo "[5/4] Calculating alignment statistics..."
+    TOTAL_READS=$(samtools view -c "$BAM" 2>/dev/null)
+    MAPPED_READS=$(samtools view -c -F 4 "$BAM" 2>/dev/null)
+    
+    if [[ $TOTAL_READS -gt 0 ]]; then
+        MAPPING_RATE=$(awk "BEGIN {printf \"%.2f\", ($MAPPED_READS * 100.0 / $TOTAL_READS)}")
+    else
+        MAPPING_RATE="0.00"
+    fi
+    
+    echo "Statistics:"
+    echo "  Total reads: $TOTAL_READS"
+    echo "  Mapped reads: $MAPPED_READS"
+    echo "  Mapping rate: $MAPPING_RATE%"
+    echo ""
+    
+    # Save to metadata
+    echo "$SAMPLE,$TOTAL_READS,$MAPPED_READS,$MAPPING_RATE,SUCCESS" >> "$METADATA"
+    
+    ((PROCESSED++))
+    
+    echo "SUCCESS: $SAMPLE completed"
+    echo "Completed: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    
+done
+
+# Final summary
+echo "=========================================="
+echo "ALIGNMENT PIPELINE COMPLETED"
+echo "=========================================="
+echo "Total samples: $TOTAL"
+echo "Successfully processed: $PROCESSED"
+echo "Skipped (already done): $SKIPPED"
+echo "Failed: $FAILED"
+echo ""
+echo "Results saved to: $OUTPUT_DIR"
+echo "Summary saved to: $METADATA"
+echo "=========================================="
+
+if [[ $FAILED -gt 0 ]]; then
+    echo "WARNING: $FAILED samples failed. Check logs in $LOG_DIR"
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+# Check if files are valid gzip files
+echo "Checking gzip integrity..."
+for file in fastq_files/*.fastq.gz; do
+    if gzip -t "$file" 2>/dev/null; then
+        echo "✓ $(basename $file): Valid"
+    else
+        echo "✗ $(basename $file): CORRUPT"
+    fi
+done

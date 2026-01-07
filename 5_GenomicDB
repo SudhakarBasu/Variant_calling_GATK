@@ -1,0 +1,247 @@
+#!/bin/bash
+#===============================================
+# GENOMICSDB IMPORT PIPELINE
+# Consolidates individual GVCFs into GenomicsDB
+# For efficient joint genotyping
+#===============================================
+
+# Configuration
+REFERENCE="references/genome.fa"
+GVCF_DIR="gatk/haplotypecaller"  # Directory with your .g.vcf.gz files
+OUTPUT_DIR="gatk/genomicsdb"
+TMP_DIR="gatk/tmp_DB"
+THREADS=4  # Number of intervals to process in parallel
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$TMP_DIR"
+
+echo "=========================================="
+echo "GenomicsDB Import Pipeline"
+echo "=========================================="
+echo "Reference: $REFERENCE"
+echo "GVCF directory: $GVCF_DIR"
+echo "Output directory: $OUTPUT_DIR"
+echo "Parallel intervals: $THREADS"
+echo "=========================================="
+echo ""
+
+# Check reference exists
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: Reference genome not found at $REFERENCE"
+    exit 1
+fi
+
+# Check reference dictionary exists
+if [[ ! -f "${REFERENCE%.fa}.dict" ]] && [[ ! -f "${REFERENCE}.dict" ]]; then
+    echo "ERROR: Reference dictionary not found."
+    echo "Please create it using: gatk CreateSequenceDictionary -R $REFERENCE"
+    exit 1
+fi
+
+# Check GATK is available
+if ! command -v gatk &> /dev/null; then
+    echo "ERROR: GATK not found in PATH"
+    exit 1
+fi
+
+#===============================================
+# STEP 1: Create Sample Name Map
+#===============================================
+echo "=========================================="
+echo "STEP 1: Creating Sample Name Map"
+echo "=========================================="
+
+SAMPLE_MAP="${OUTPUT_DIR}/sample_name_map.txt"
+> "$SAMPLE_MAP"
+
+# Count GVCFs
+TOTAL_GVCFS=$(ls ${GVCF_DIR}/*.g.vcf.gz 2>/dev/null | wc -l)
+
+if [[ $TOTAL_GVCFS -eq 0 ]]; then
+    echo "ERROR: No .g.vcf.gz files found in $GVCF_DIR"
+    exit 1
+fi
+
+echo "Found $TOTAL_GVCFS GVCF files"
+echo ""
+
+# Create map file
+echo "Creating sample name map..."
+for GVCF in ${GVCF_DIR}/*.g.vcf.gz; do
+    SAMPLE=$(basename "$GVCF" | sed 's/.g.vcf.gz$//')
+    FULL_PATH=$(realpath "$GVCF")
+    
+    # Verify GVCF index exists
+    if [[ ! -f "${GVCF}.tbi" ]]; then
+        echo "WARNING: Index not found for $SAMPLE - creating index..."
+        gatk IndexFeatureFile -I "$GVCF"
+    fi
+    
+    echo -e "${SAMPLE}\t${FULL_PATH}" >> "$SAMPLE_MAP"
+done
+
+echo "Sample map created: $SAMPLE_MAP"
+echo "Total samples: $(wc -l < $SAMPLE_MAP)"
+echo ""
+
+#===============================================
+# STEP 2: Create Intervals File
+#===============================================
+echo "=========================================="
+echo "STEP 2: Creating Intervals File"
+echo "=========================================="
+
+INTERVALS="${OUTPUT_DIR}/genome_intervals.list"
+
+# Extract chromosome/scaffold names from reference dictionary
+if [[ -f "${REFERENCE}.dict" ]]; then
+    DICT_FILE="${REFERENCE}.dict"
+elif [[ -f "${REFERENCE%.fa}.dict" ]]; then
+    DICT_FILE="${REFERENCE%.fa}.dict"
+else
+    echo "ERROR: Reference dictionary not found"
+    exit 1
+fi
+
+echo "Extracting intervals from reference dictionary..."
+grep "^@SQ" "$DICT_FILE" | awk '{print $2}' | sed 's/SN://' > "$INTERVALS"
+
+INTERVAL_COUNT=$(wc -l < "$INTERVALS")
+echo "Created intervals file: $INTERVALS"
+echo "Total intervals: $INTERVAL_COUNT"
+echo ""
+
+# Show first few intervals
+echo "First 5 intervals:"
+head -5 "$INTERVALS"
+echo ""
+
+#===============================================
+# STEP 3: Run GenomicsDBImport
+#===============================================
+echo "=========================================="
+echo "STEP 3: Running GenomicsDBImport"
+echo "=========================================="
+echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+
+DATABASE="${OUTPUT_DIR}/genomicsdb_database"
+
+# Remove existing database if present
+if [[ -d "$DATABASE" ]]; then
+    echo "WARNING: Existing database found. Removing..."
+    rm -rf "$DATABASE"
+    echo ""
+fi
+
+echo "Importing GVCFs into GenomicsDB..."
+echo "This may take 1-3 hours depending on genome size and sample count..."
+echo ""
+echo "Progress will be shown every 10 seconds..."
+echo ""
+
+START_TIME=$(date +%s)
+
+gatk GenomicsDBImport \
+    --genomicsdb-workspace-path "$DATABASE" \
+    --sample-name-map "$SAMPLE_MAP" \
+    --intervals "$INTERVALS" \
+    --tmp-dir "$TMP_DIR" \
+    --max-num-intervals-to-import-in-parallel $THREADS \
+    --reader-threads 1 \
+    --batch-size 0 \
+    2>&1 | tee "${OUTPUT_DIR}/genomicsdb_import.log"
+
+GATK_EXIT=${PIPESTATUS[0]}
+
+END_TIME=$(date +%s)
+RUNTIME=$((END_TIME - START_TIME))
+RUNTIME_HOURS=$((RUNTIME / 3600))
+RUNTIME_MIN=$(((RUNTIME % 3600) / 60))
+
+echo ""
+echo "GATK exit code: $GATK_EXIT"
+
+if [[ $GATK_EXIT -ne 0 ]]; then
+    echo "ERROR: GenomicsDBImport failed!"
+    echo "Check log file: ${OUTPUT_DIR}/genomicsdb_import.log"
+    tail -50 "${OUTPUT_DIR}/genomicsdb_import.log"
+    exit 1
+fi
+
+echo ""
+echo "GenomicsDBImport completed successfully"
+echo "Runtime: ${RUNTIME_HOURS}h ${RUNTIME_MIN}m"
+echo ""
+
+#===============================================
+# STEP 4: Verify Database
+#===============================================
+echo "=========================================="
+echo "STEP 4: Verifying GenomicsDB"
+echo "=========================================="
+
+if [[ -d "$DATABASE" ]]; then
+    DB_SIZE=$(du -sh "$DATABASE" | awk '{print $1}')
+    echo "✅ Database created successfully"
+    echo "   Location: $DATABASE"
+    echo "   Size: $DB_SIZE"
+    echo ""
+    
+    # Count samples in database
+    if [[ -f "${DATABASE}/callset.json" ]]; then
+        SAMPLE_COUNT=$(grep -o '"sample_name"' "${DATABASE}/callset.json" | wc -l)
+        echo "   Samples imported: $SAMPLE_COUNT"
+    fi
+else
+    echo "❌ ERROR: Database directory not created!"
+    exit 1
+fi
+
+echo ""
+
+#===============================================
+# FINAL SUMMARY
+#===============================================
+echo "=========================================="
+echo "GENOMICSDB IMPORT COMPLETED"
+echo "=========================================="
+echo "Total GVCFs imported: $TOTAL_GVCFS"
+echo "Database location: $DATABASE"
+echo "Database size: $DB_SIZE"
+echo "Runtime: ${RUNTIME_HOURS}h ${RUNTIME_MIN}m"
+echo ""
+echo "Next step: Run GenotypeGVCFs for joint genotyping"
+echo "=========================================="
+
+# Create summary file
+SUMMARY="${OUTPUT_DIR}/import_summary.txt"
+cat > "$SUMMARY" << EOF
+GenomicsDB Import Summary
+========================
+Date: $(date)
+Total samples: $TOTAL_GVCFS
+Total intervals: $INTERVAL_COUNT
+Database location: $DATABASE
+Database size: $DB_SIZE
+Runtime: ${RUNTIME_HOURS}h ${RUNTIME_MIN}m
+Status: SUCCESS
+
+Files created:
+- Sample map: $SAMPLE_MAP
+- Intervals: $INTERVALS
+- Database: $DATABASE
+- Log: ${OUTPUT_DIR}/genomicsdb_import.log
+
+Next command:
+gatk GenotypeGVCFs \\
+    -R $REFERENCE \\
+    -V gendb://$DATABASE \\
+    -O gatk/joint_genotyping/cohort.vcf.gz
+EOF
+
+echo ""
+echo "Summary saved to: $SUMMARY"
+echo ""
+
+exit 0

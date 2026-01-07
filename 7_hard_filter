@@ -1,0 +1,339 @@
+#!/bin/bash
+
+#===============================================
+# VARIANT FILTRATION - HARD FILTERING PIPELINE
+# Apply quality filters to raw VCF
+# Based on GATK best practices for hard filtering
+#===============================================
+
+# Configuration
+REFERENCE="references/genome.fa"
+INPUT_VCF="gatk/joint_genotyping/cohort_raw.vcf.gz"
+OUTPUT_DIR="gatk/filtered"
+FILTERED_VCF="${OUTPUT_DIR}/cohort_hard_filtered.vcf.gz"
+LOG_DIR="gatk/logs"
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
+
+echo "=========================================="
+echo "Variant Filtration Pipeline"
+echo "=========================================="
+echo "Reference: $REFERENCE"
+echo "Input VCF: $INPUT_VCF"
+echo "Output VCF: $FILTERED_VCF"
+echo "=========================================="
+echo ""
+
+# Check prerequisites
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: Reference genome not found at $REFERENCE"
+    exit 1
+fi
+
+if [[ ! -f "$INPUT_VCF" ]]; then
+    echo "ERROR: Input VCF not found at $INPUT_VCF"
+    exit 1
+fi
+
+if ! command -v gatk &> /dev/null; then
+    echo "ERROR: GATK not found in PATH"
+    exit 1
+fi
+
+#===============================================
+# Pre-Filtering Statistics
+#===============================================
+echo "=========================================="
+echo "Pre-Filtering Statistics"
+echo "=========================================="
+
+TOTAL_BEFORE=$(bcftools view -H "$INPUT_VCF" 2>/dev/null | wc -l)
+SNPS_BEFORE=$(bcftools view -H -v snps "$INPUT_VCF" 2>/dev/null | wc -l)
+INDELS_BEFORE=$(bcftools view -H -v indels "$INPUT_VCF" 2>/dev/null | wc -l)
+
+echo "Total variants: $(printf "%'d" $TOTAL_BEFORE)"
+echo "  SNPs: $(printf "%'d" $SNPS_BEFORE)"
+echo "  Indels: $(printf "%'d" $INDELS_BEFORE)"
+echo ""
+
+#===============================================
+# Apply Hard Filters
+#===============================================
+echo "=========================================="
+echo "Applying Hard Filters"
+echo "=========================================="
+echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+
+echo "Filter expressions (matching original command):"
+echo "  QD < 2.0          : Quality by Depth"
+echo "  FS > 60.0         : Fisher Strand bias"
+echo "  MQ < 40.0         : Mapping Quality"
+echo "  MQRankSum < -12.5 : Mapping Quality Rank Sum"
+echo "  ReadPosRankSum < -8.0 : Read Position Rank Sum"
+echo "  SOR > 3.0         : Strand Odds Ratio"
+echo ""
+
+START_TIME=$(date +%s)
+
+# Run VariantFiltration with expressions matching original command
+gatk VariantFiltration \
+    --reference "$REFERENCE" \
+    --variant "$INPUT_VCF" \
+    --output "$FILTERED_VCF" \
+    --filter-expression "QD < 2.0" \
+    --filter-name "qd_fil" \
+    --filter-expression "FS > 60.0" \
+    --filter-name "fs_fil" \
+    --filter-expression "MQ < 40.0" \
+    --filter-name "mq_fil" \
+    --filter-expression "MQRankSum < -12.5" \
+    --filter-name "mqRankSum_fil" \
+    --filter-expression "ReadPosRankSum < -8.0" \
+    --filter-name "rdPosRS_fil" \
+    --filter-expression "SOR > 3.0" \
+    --filter-name "sor_fil" \
+    --cluster-size 3 \
+    --cluster-window-size 0 \
+    2>&1 | tee "${LOG_DIR}/variant_filtration.log"
+
+GATK_EXIT=${PIPESTATUS[0]}
+
+END_TIME=$(date +%s)
+RUNTIME=$((END_TIME - START_TIME))
+
+echo ""
+echo "GATK exit code: $GATK_EXIT"
+
+if [[ $GATK_EXIT -ne 0 ]]; then
+    echo "ERROR: VariantFiltration failed!"
+    echo "Check log file: ${LOG_DIR}/variant_filtration.log"
+    tail -50 "${LOG_DIR}/variant_filtration.log"
+    exit 1
+fi
+
+echo "VariantFiltration completed in $((RUNTIME / 60)) minutes"
+echo ""
+
+#===============================================
+# Post-Filtering Statistics
+#===============================================
+echo "=========================================="
+echo "Post-Filtering Statistics"
+echo "=========================================="
+
+# Count filtered variants
+TOTAL_AFTER=$(bcftools view -H "$FILTERED_VCF" 2>/dev/null | wc -l)
+PASS_VARIANTS=$(bcftools view -H -f PASS "$FILTERED_VCF" 2>/dev/null | wc -l)
+FILTERED_OUT=$(bcftools view -H -e 'FILTER="PASS"' "$FILTERED_VCF" 2>/dev/null | wc -l)
+
+echo "Total variants in output: $(printf "%'d" $TOTAL_AFTER)"
+echo "  PASS (high quality): $(printf "%'d" $PASS_VARIANTS)"
+echo "  Filtered (failed QC): $(printf "%'d" $FILTERED_OUT)"
+echo ""
+
+# Calculate pass rate
+if [[ $TOTAL_BEFORE -gt 0 ]]; then
+    PASS_RATE=$(awk "BEGIN {printf \"%.2f\", ($PASS_VARIANTS * 100.0 / $TOTAL_BEFORE)}")
+    echo "Pass rate: ${PASS_RATE}%"
+fi
+echo ""
+
+# Count variants by filter
+echo "Variants failing each filter:"
+for FILTER in qd_fil fs_fil mq_fil mqRankSum_fil rdPosRS_fil sor_fil; do
+    COUNT=$(bcftools view -H -i "FILTER~\"$FILTER\"" "$FILTERED_VCF" 2>/dev/null | wc -l)
+    echo "  $FILTER: $(printf "%'d" $COUNT)"
+done
+echo ""
+
+#===============================================
+# Extract PASS Variants Only
+#===============================================
+echo "=========================================="
+echo "Creating PASS-only VCF"
+echo "=========================================="
+
+PASS_VCF="${OUTPUT_DIR}/cohort_PASS_only.vcf.gz"
+
+echo "Extracting variants that passed all filters..."
+bcftools view -f PASS "$FILTERED_VCF" -Oz -o "$PASS_VCF"
+bcftools index -t "$PASS_VCF"
+
+PASS_SNPS=$(bcftools view -H -v snps -f PASS "$FILTERED_VCF" 2>/dev/null | wc -l)
+PASS_INDELS=$(bcftools view -H -v indels -f PASS "$FILTERED_VCF" 2>/dev/null | wc -l)
+
+echo "✓ PASS-only VCF created: $PASS_VCF"
+echo "  PASS SNPs: $(printf "%'d" $PASS_SNPS)"
+echo "  PASS Indels: $(printf "%'d" $PASS_INDELS)"
+echo ""
+
+#===============================================
+# Quality Assessment of Filtered VCF
+#===============================================
+echo "=========================================="
+echo "Quality Assessment"
+echo "=========================================="
+
+# Calculate Ti/Tv on PASS variants
+echo "Calculating Ti/Tv ratio on PASS variants..."
+TITV_PASS=$(bcftools stats -f PASS "$FILTERED_VCF" 2>/dev/null | grep "^TSTV" | cut -f5)
+
+if [[ -n "$TITV_PASS" ]]; then
+    echo "Ti/Tv ratio (PASS variants): $TITV_PASS"
+    
+    TITV_FLOAT=$(echo "$TITV_PASS" | awk '{print $1}')
+    if (( $(echo "$TITV_FLOAT >= 2.0" | bc -l) )); then
+        echo "Quality assessment: ✓ Excellent (≥ 2.0)"
+    elif (( $(echo "$TITV_FLOAT >= 1.8" | bc -l) )); then
+        echo "Quality assessment: ✓ Good (1.8-2.0)"
+    elif (( $(echo "$TITV_FLOAT >= 1.5" | bc -l) )); then
+        echo "Quality assessment: ⚠ Fair (1.5-1.8)"
+    else
+        echo "Quality assessment: ⚠ Poor (< 1.5)"
+    fi
+fi
+echo ""
+
+#===============================================
+# Create Summary Report
+#===============================================
+echo "=========================================="
+echo "Creating Summary Report"
+echo "=========================================="
+
+SUMMARY="${OUTPUT_DIR}/filtration_summary.txt"
+
+cat > "$SUMMARY" << EOF
+========================================
+VARIANT FILTRATION SUMMARY
+========================================
+Date: $(date)
+Pipeline: VariantFiltration (Hard Filters)
+
+INPUT
+-----
+Raw VCF: $INPUT_VCF
+Total raw variants: $(printf "%'d" $TOTAL_BEFORE)
+  Raw SNPs: $(printf "%'d" $SNPS_BEFORE)
+  Raw Indels: $(printf "%'d" $INDELS_BEFORE)
+
+FILTER CRITERIA
+---------------
+QD < 2.0               : Quality by Depth (low confidence)
+FS > 60.0              : Fisher Strand bias (strand bias)
+MQ < 40.0              : Mapping Quality (poor mapping)
+MQRankSum < -12.5      : MQ Rank Sum (ref/alt MQ difference)
+ReadPosRankSum < -8.0  : Read Position (positional bias)
+SOR > 3.0              : Strand Odds Ratio (strand bias)
+
+Clustering filters:
+  --cluster-size 3
+  --cluster-window-size 0
+
+OUTPUT
+------
+Filtered VCF: $FILTERED_VCF
+PASS-only VCF: $PASS_VCF
+
+RESULTS
+-------
+Total variants retained: $(printf "%'d" $TOTAL_AFTER)
+Variants passing filters: $(printf "%'d" $PASS_VARIANTS) (${PASS_RATE}%)
+Variants filtered out: $(printf "%'d" $FILTERED_OUT) ($((100 - ${PASS_RATE%.*}))%)
+
+PASS variant breakdown:
+  PASS SNPs: $(printf "%'d" $PASS_SNPS)
+  PASS Indels: $(printf "%'d" $PASS_INDELS)
+  SNP/Indel ratio: $(awk "BEGIN {printf \"%.2f\", $PASS_SNPS/$PASS_INDELS}")
+
+QUALITY METRICS
+---------------
+Ti/Tv ratio (PASS): $TITV_PASS
+$(if [[ -n "$TITV_PASS" ]]; then
+    TITV_FLOAT=$(echo "$TITV_PASS" | awk '{print $1}')
+    if (( $(echo "$TITV_FLOAT >= 2.0" | bc -l) )); then
+        echo "Quality: ✓ EXCELLENT - High quality variants"
+    elif (( $(echo "$TITV_FLOAT >= 1.8" | bc -l) )); then
+        echo "Quality: ✓ GOOD - Acceptable for analysis"
+    elif (( $(echo "$TITV_FLOAT >= 1.5" | bc -l) )); then
+        echo "Quality: ⚠ FAIR - Consider additional filtering"
+    else
+        echo "Quality: ⚠ POOR - Additional QC recommended"
+    fi
+fi)
+
+FILTER BREAKDOWN
+----------------
+$(for FILTER in qd_fil fs_fil mq_fil mqRankSum_fil rdPosRS_fil sor_fil; do
+    COUNT=$(bcftools view -H -i "FILTER~\"$FILTER\"" "$FILTERED_VCF" 2>/dev/null | wc -l)
+    echo "$FILTER: $(printf "%'d" $COUNT)"
+done)
+
+NEXT STEPS
+----------
+1. Use PASS-only VCF for downstream analysis:
+   $PASS_VCF
+
+2. Apply additional filters if needed (MAF, missingness):
+   bcftools view -i 'INFO/AF>=0.05 & F_MISSING<=0.1' \\
+       $PASS_VCF -Oz -o cohort_final.vcf.gz
+
+3. Convert to PLINK for GWAS:
+   plink --vcf $PASS_VCF \\
+         --make-bed --out cohort_plink \\
+         --allow-extra-chr
+
+4. Run population structure analysis (PCA, admixture)
+
+========================================
+EOF
+
+cat "$SUMMARY"
+
+#===============================================
+# Additional Filtering Recommendations
+#===============================================
+echo ""
+echo "=========================================="
+echo "Optional: Additional Filtering"
+echo "=========================================="
+echo ""
+echo "For GWAS, consider additional filters:"
+echo ""
+echo "1. Minor Allele Frequency (MAF) filter:"
+echo "   bcftools view -i 'INFO/AF>=0.05' \\"
+echo "       $PASS_VCF -Oz -o cohort_maf05.vcf.gz"
+echo ""
+echo "2. Missingness filter:"
+echo "   bcftools view -e 'F_MISSING > 0.1' \\"
+echo "       $PASS_VCF -Oz -o cohort_geno90.vcf.gz"
+echo ""
+echo "3. Combined filters (recommended for GWAS):"
+echo "   bcftools view -i 'INFO/AF>=0.05 & F_MISSING<=0.1' \\"
+echo "       $PASS_VCF -Oz -o cohort_gwas_ready.vcf.gz"
+echo ""
+
+#===============================================
+# Final Summary
+#===============================================
+echo "=========================================="
+echo "FILTRATION COMPLETED SUCCESSFULLY"
+echo "=========================================="
+echo ""
+echo "Output files:"
+echo "  ✓ Filtered VCF (with tags): $FILTERED_VCF"
+echo "  ✓ PASS-only VCF: $PASS_VCF"
+echo "  ✓ Summary report: $SUMMARY"
+echo "  ✓ Log file: ${LOG_DIR}/variant_filtration.log"
+echo ""
+echo "Results:"
+echo "  • Started with: $(printf "%'d" $TOTAL_BEFORE) variants"
+echo "  • Passed filters: $(printf "%'d" $PASS_VARIANTS) variants (${PASS_RATE}%)"
+echo "  • Ti/Tv ratio: $TITV_PASS"
+echo ""
+echo "Use $PASS_VCF for downstream GWAS analysis"
+echo "=========================================="
+
+exit 0

@@ -1,0 +1,217 @@
+#!/bin/bash
+
+#===============================================
+# GATK HAPLOTYPECALLER PIPELINE FOR BRASSICA JUNCEA
+# Generates GVCF files from marked BAM files
+# Configuration: Joint Genotyping with Enhanced GQ Bands
+#===============================================
+
+# Configuration
+REFERENCE="references/genome.fa"
+BAM_DIR="alignment/marked"  # Directory containing your marked BAM files
+OUTPUT_DIR="gatk/haplotypecaller"
+TMP_DIR="gatk/tmp"
+THREADS=32  # For native-pair-hmm-threads (auto-optimized)
+LOG_DIR="gatk/logs"
+
+# GATK Parameters
+PLOIDY=2
+MIN_CONFIDENCE=30.0
+MIN_MAPPING_QUALITY=20  # Non-default: filters low-quality mappings
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$TMP_DIR"
+
+echo "=========================================="
+echo "GATK HaplotypeCaller Pipeline"
+echo "=========================================="
+echo "Reference: $REFERENCE"
+echo "Input directory: $BAM_DIR"
+echo "Output directory: $OUTPUT_DIR"
+echo "Temp directory: $TMP_DIR"
+echo "Ploidy: $PLOIDY"
+echo "Min confidence threshold: $MIN_CONFIDENCE"
+echo "Min mapping quality: $MIN_MAPPING_QUALITY"
+echo "GQ Bands: 1-60 (by 1), 70, 80, 90, 99"
+echo "=========================================="
+echo ""
+
+# Check reference exists
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: Reference genome not found at $REFERENCE"
+    exit 1
+fi
+
+# Check reference dictionary exists
+if [[ ! -f "${REFERENCE%.fa}.dict" ]] && [[ ! -f "${REFERENCE}.dict" ]]; then
+    echo "ERROR: Reference dictionary not found."
+    echo "Please create it using: gatk CreateSequenceDictionary -R $REFERENCE"
+    exit 1
+fi
+
+# Check reference index exists
+if [[ ! -f "${REFERENCE}.fai" ]]; then
+    echo "ERROR: Reference index not found."
+    echo "Please create it using: samtools faidx $REFERENCE"
+    exit 1
+fi
+
+# Check GATK is available
+if ! command -v gatk &> /dev/null; then
+    echo "ERROR: GATK not found in PATH"
+    echo "Please install GATK or add it to your PATH"
+    exit 1
+fi
+
+# Count samples (looking for marked BAM files)
+TOTAL=$(ls ${BAM_DIR}/*.bam 2>/dev/null | wc -l)
+if [[ $TOTAL -eq 0 ]]; then
+    echo "ERROR: No .bam files found in $BAM_DIR"
+    exit 1
+fi
+
+echo "Found $TOTAL samples to process"
+echo ""
+
+# Initialize counters and metadata file
+PROCESSED=0
+FAILED=0
+SKIPPED=0
+METADATA="${LOG_DIR}/haplotypecaller_summary.csv"
+echo "Sample,Status,VariantCount,RunTime" > "$METADATA"
+
+# Process each sample
+for BAM in ${BAM_DIR}/*.bam; do
+    
+    # Get sample name
+    SAMPLE=$(basename "$BAM" | sed 's/.bam$//')
+    
+    # Check BAM index exists
+    if [[ ! -f "${BAM}.bai" ]]; then
+        echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $SAMPLE - ERROR: BAM index not found"
+        echo "Please index using: samtools index $BAM"
+        ((FAILED++))
+        echo "$SAMPLE,FAILED_NO_INDEX,0,0" >> "$METADATA"
+        continue
+    fi
+    
+    GVCF="${OUTPUT_DIR}/${SAMPLE}.g.vcf.gz"
+    LOG="${LOG_DIR}/${SAMPLE}.log"
+    
+    # Skip if already processed
+    if [[ -f "${GVCF}.tbi" ]]; then
+        echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] $SAMPLE - SKIPPED (already processed)"
+        ((SKIPPED++))
+        continue
+    fi
+    
+    echo "=========================================="
+    echo "[$((PROCESSED+FAILED+SKIPPED+1))/$TOTAL] Processing: $SAMPLE"
+    echo "=========================================="
+    START_TIME=$(date +%s)
+    echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    
+    # Build GATK command
+    echo "Running GATK HaplotypeCaller..."
+    echo "Input: $BAM"
+    echo "Output: $GVCF"
+    echo "This may take 30-60 minutes per sample..."
+    echo ""
+    
+    # Run GATK HaplotypeCaller with enhanced GQ bands (1-60 individually, then 70,80,90,99)
+    gatk HaplotypeCaller \
+        --reference "$REFERENCE" \
+        --input "$BAM" \
+        --output "$GVCF" \
+        --tmp-dir "$TMP_DIR" \
+        --emit-ref-confidence GVCF \
+        --sample-ploidy $PLOIDY \
+        --standard-min-confidence-threshold-for-calling $MIN_CONFIDENCE \
+        --minimum-mapping-quality $MIN_MAPPING_QUALITY \
+        --native-pair-hmm-threads $THREADS \
+        --gvcf-gq-bands 1 --gvcf-gq-bands 2 --gvcf-gq-bands 3 --gvcf-gq-bands 4 --gvcf-gq-bands 5 \
+        --gvcf-gq-bands 6 --gvcf-gq-bands 7 --gvcf-gq-bands 8 --gvcf-gq-bands 9 --gvcf-gq-bands 10 \
+        --gvcf-gq-bands 11 --gvcf-gq-bands 12 --gvcf-gq-bands 13 --gvcf-gq-bands 14 --gvcf-gq-bands 15 \
+        --gvcf-gq-bands 16 --gvcf-gq-bands 17 --gvcf-gq-bands 18 --gvcf-gq-bands 19 --gvcf-gq-bands 20 \
+        --gvcf-gq-bands 21 --gvcf-gq-bands 22 --gvcf-gq-bands 23 --gvcf-gq-bands 24 --gvcf-gq-bands 25 \
+        --gvcf-gq-bands 26 --gvcf-gq-bands 27 --gvcf-gq-bands 28 --gvcf-gq-bands 29 --gvcf-gq-bands 30 \
+        --gvcf-gq-bands 31 --gvcf-gq-bands 32 --gvcf-gq-bands 33 --gvcf-gq-bands 34 --gvcf-gq-bands 35 \
+        --gvcf-gq-bands 36 --gvcf-gq-bands 37 --gvcf-gq-bands 38 --gvcf-gq-bands 39 --gvcf-gq-bands 40 \
+        --gvcf-gq-bands 41 --gvcf-gq-bands 42 --gvcf-gq-bands 43 --gvcf-gq-bands 44 --gvcf-gq-bands 45 \
+        --gvcf-gq-bands 46 --gvcf-gq-bands 47 --gvcf-gq-bands 48 --gvcf-gq-bands 49 --gvcf-gq-bands 50 \
+        --gvcf-gq-bands 51 --gvcf-gq-bands 52 --gvcf-gq-bands 53 --gvcf-gq-bands 54 --gvcf-gq-bands 55 \
+        --gvcf-gq-bands 56 --gvcf-gq-bands 57 --gvcf-gq-bands 58 --gvcf-gq-bands 59 --gvcf-gq-bands 60 \
+        --gvcf-gq-bands 70 --gvcf-gq-bands 80 --gvcf-gq-bands 90 --gvcf-gq-bands 99 \
+        2>&1 | tee "$LOG"
+    
+    GATK_EXIT=${PIPESTATUS[0]}
+    
+    echo ""
+    echo "GATK exit code: $GATK_EXIT"
+    
+    if [[ $GATK_EXIT -ne 0 ]]; then
+        echo "ERROR: HaplotypeCaller failed!"
+        echo "Check log file: $LOG"
+        tail -20 "$LOG"
+        ((FAILED++))
+        END_TIME=$(date +%s)
+        RUNTIME=$((END_TIME - START_TIME))
+        echo "$SAMPLE,FAILED_GATK,0,$RUNTIME" >> "$METADATA"
+        rm -f "$GVCF" "${GVCF}.tbi"
+        continue
+    fi
+    
+    echo "HaplotypeCaller completed successfully"
+    echo ""
+    
+    # Calculate statistics
+    echo "Calculating statistics..."
+    if [[ -f "$GVCF" ]]; then
+        VARIANT_COUNT=$(zgrep -v "^#" "$GVCF" 2>/dev/null | wc -l)
+        echo "Variant sites called: $VARIANT_COUNT"
+    else
+        VARIANT_COUNT=0
+        echo "WARNING: Output GVCF not found!"
+    fi
+    echo ""
+    
+    END_TIME=$(date +%s)
+    RUNTIME=$((END_TIME - START_TIME))
+    RUNTIME_MIN=$((RUNTIME / 60))
+    
+    # Save to metadata
+    echo "$SAMPLE,SUCCESS,$VARIANT_COUNT,$RUNTIME_MIN" >> "$METADATA"
+    
+    ((PROCESSED++))
+    
+    echo "SUCCESS: $SAMPLE completed in $RUNTIME_MIN minutes"
+    echo "Completed: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    
+done
+
+# Final summary
+echo "=========================================="
+echo "HAPLOTYPECALLER PIPELINE COMPLETED"
+echo "=========================================="
+echo "Total samples: $TOTAL"
+echo "Successfully processed: $PROCESSED"
+echo "Skipped (already done): $SKIPPED"
+echo "Failed: $FAILED"
+echo ""
+echo "Results saved to: $OUTPUT_DIR"
+echo "Summary saved to: $METADATA"
+echo "=========================================="
+
+if [[ $FAILED -gt 0 ]]; then
+    echo "WARNING: $FAILED samples failed. Check logs in $LOG_DIR"
+fi
+
+# Cleanup temp directory
+echo ""
+echo "Cleaning up temporary files..."
+rm -rf "$TMP_DIR"/*
+echo "Cleanup completed"
+
+exit 0

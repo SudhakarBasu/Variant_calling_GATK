@@ -1,0 +1,319 @@
+#!/bin/bash
+
+#===============================================
+# GENOTYPE GVCFS - JOINT GENOTYPING PIPELINE
+# Final step: Generate multi-sample VCF from GenomicsDB
+#===============================================
+
+# Configuration
+REFERENCE="references/genome.fa"
+GENOMICSDB="gatk/genomicsdb/genomicsdb_database"
+OUTPUT_DIR="gatk/joint_genotyping"
+OUTPUT_VCF="${OUTPUT_DIR}/cohort_raw.vcf.gz"
+TMP_DIR="gatk/tmp"
+INTERVALS="gatk/genomicsdb/genome_intervals.list"  # Use same intervals as GenomicsDBImport
+LOG_DIR="gatk/logs"
+
+# GATK Parameters
+PLOIDY=2
+MIN_CONFIDENCE=30.0
+HETEROZYGOSITY=0.001
+INDEL_HETEROZYGOSITY=0.000125
+
+# Create directories
+mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$TMP_DIR"
+
+echo "=========================================="
+echo "GenotypeGVCFs - Joint Genotyping Pipeline"
+echo "=========================================="
+echo "Reference: $REFERENCE"
+echo "GenomicsDB: $GENOMICSDB"
+echo "Output VCF: $OUTPUT_VCF"
+echo "Intervals: $INTERVALS"
+echo "Ploidy: $PLOIDY"
+echo "Min confidence: $MIN_CONFIDENCE"
+echo "=========================================="
+echo ""
+
+# Check prerequisites
+echo "Checking prerequisites..."
+
+if [[ ! -f "$REFERENCE" ]]; then
+    echo "ERROR: Reference genome not found at $REFERENCE"
+    exit 1
+fi
+
+if [[ ! -d "$GENOMICSDB" ]]; then
+    echo "ERROR: GenomicsDB not found at $GENOMICSDB"
+    echo "Please run GenomicsDBImport first"
+    exit 1
+fi
+
+if [[ ! -f "$INTERVALS" ]]; then
+    echo "ERROR: Intervals file not found at $INTERVALS"
+    exit 1
+fi
+
+if ! command -v gatk &> /dev/null; then
+    echo "ERROR: GATK not found in PATH"
+    exit 1
+fi
+
+echo "✓ All prerequisites met"
+echo ""
+
+#===============================================
+# Check GenomicsDB Contents
+#===============================================
+echo "=========================================="
+echo "GenomicsDB Information"
+echo "=========================================="
+
+DB_SIZE=$(du -sh "$GENOMICSDB" | awk '{print $1}')
+echo "Database size: $DB_SIZE"
+
+if [[ -f "${GENOMICSDB}/callset.json" ]]; then
+    SAMPLE_COUNT=$(grep -o '"sample_name"' "${GENOMICSDB}/callset.json" | wc -l)
+    echo "Samples in database: $SAMPLE_COUNT"
+fi
+
+INTERVAL_COUNT=$(wc -l < "$INTERVALS")
+echo "Intervals to genotype: $INTERVAL_COUNT"
+echo ""
+
+#===============================================
+# Run GenotypeGVCFs
+#===============================================
+echo "=========================================="
+echo "Running Joint Genotyping"
+echo "=========================================="
+echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+
+echo "This will take 2-4 hours for 295 samples..."
+echo "Progress updates every 10 seconds"
+echo ""
+
+START_TIME=$(date +%s)
+
+# Run GenotypeGVCFs
+gatk GenotypeGVCFs \
+    --reference "$REFERENCE" \
+    --variant "gendb://${GENOMICSDB}" \
+    --output "$OUTPUT_VCF" \
+    --intervals "$INTERVALS" \
+    --tmp-dir "$TMP_DIR" \
+    --sample-ploidy $PLOIDY \
+    --standard-min-confidence-threshold-for-calling $MIN_CONFIDENCE \
+    --heterozygosity $HETEROZYGOSITY \
+    --indel-heterozygosity $INDEL_HETEROZYGOSITY \
+    --genomicsdb-max-alternate-alleles 50 \
+    --max-alternate-alleles 6 \
+    --max-genotype-count 1024 \
+    --include-non-variant-sites false \
+    --only-output-calls-starting-in-intervals false \
+    2>&1 | tee "${LOG_DIR}/genotype_gvcfs.log"
+
+GATK_EXIT=${PIPESTATUS[0]}
+
+END_TIME=$(date +%s)
+RUNTIME=$((END_TIME - START_TIME))
+RUNTIME_HOURS=$((RUNTIME / 3600))
+RUNTIME_MIN=$(((RUNTIME % 3600) / 60))
+
+echo ""
+echo "GATK exit code: $GATK_EXIT"
+
+if [[ $GATK_EXIT -ne 0 ]]; then
+    echo "ERROR: GenotypeGVCFs failed!"
+    echo "Check log file: ${LOG_DIR}/genotype_gvcfs.log"
+    tail -50 "${LOG_DIR}/genotype_gvcfs.log"
+    exit 1
+fi
+
+echo ""
+echo "GenotypeGVCFs completed successfully"
+echo "Runtime: ${RUNTIME_HOURS}h ${RUNTIME_MIN}m"
+echo ""
+
+#===============================================
+# Validate and Summarize Output VCF
+#===============================================
+echo "=========================================="
+echo "Validating Output VCF"
+echo "=========================================="
+
+if [[ ! -f "$OUTPUT_VCF" ]]; then
+    echo "ERROR: Output VCF not created!"
+    exit 1
+fi
+
+VCF_SIZE=$(du -sh "$OUTPUT_VCF" | awk '{print $1}')
+echo "✓ Output VCF created"
+echo "  File: $OUTPUT_VCF"
+echo "  Size: $VCF_SIZE"
+echo ""
+
+# Check VCF index
+if [[ -f "${OUTPUT_VCF}.tbi" ]]; then
+    echo "✓ VCF index created"
+else
+    echo "⚠ Creating VCF index..."
+    gatk IndexFeatureFile -I "$OUTPUT_VCF"
+fi
+echo ""
+
+# Basic VCF statistics
+echo "Calculating VCF statistics..."
+TOTAL_VARIANTS=$(bcftools view -H "$OUTPUT_VCF" 2>/dev/null | wc -l)
+SNPS=$(bcftools view -H -v snps "$OUTPUT_VCF" 2>/dev/null | wc -l)
+INDELS=$(bcftools view -H -v indels "$OUTPUT_VCF" 2>/dev/null | wc -l)
+SAMPLES=$(bcftools query -l "$OUTPUT_VCF" 2>/dev/null | wc -l)
+
+echo ""
+echo "VCF Summary:"
+echo "  Total variants: $(printf "%'d" $TOTAL_VARIANTS)"
+echo "  SNPs: $(printf "%'d" $SNPS)"
+echo "  Indels: $(printf "%'d" $INDELS)"
+echo "  SNP/Indel ratio: $(awk "BEGIN {printf \"%.2f\", $SNPS/$INDELS}")"
+echo "  Samples: $SAMPLES"
+echo ""
+
+#===============================================
+# Calculate Ti/Tv Ratio (Quality Metric)
+#===============================================
+echo "Calculating Ti/Tv ratio (quality indicator)..."
+TITV=$(bcftools stats "$OUTPUT_VCF" 2>/dev/null | grep "^TSTV" | cut -f5)
+
+if [[ -n "$TITV" ]]; then
+    echo "  Ti/Tv ratio: $TITV"
+    
+    # Evaluate quality
+    TITV_FLOAT=$(echo "$TITV" | awk '{print $1}')
+    if (( $(echo "$TITV_FLOAT >= 2.0" | bc -l) )); then
+        echo "  Quality: ✓ Excellent (≥ 2.0)"
+    elif (( $(echo "$TITV_FLOAT >= 1.8" | bc -l) )); then
+        echo "  Quality: ✓ Good (1.8-2.0)"
+    elif (( $(echo "$TITV_FLOAT >= 1.5" | bc -l) )); then
+        echo "  Quality: ⚠ Fair (1.5-1.8) - Consider filtering"
+    else
+        echo "  Quality: ⚠ Poor (< 1.5) - Filtering recommended"
+    fi
+else
+    echo "  Could not calculate Ti/Tv ratio"
+fi
+echo ""
+
+#===============================================
+# Create Summary Report
+#===============================================
+echo "=========================================="
+echo "Creating Summary Report"
+echo "=========================================="
+
+SUMMARY="${OUTPUT_DIR}/joint_genotyping_summary.txt"
+
+cat > "$SUMMARY" << EOF
+========================================
+JOINT GENOTYPING SUMMARY
+========================================
+Date: $(date)
+Pipeline: GenotypeGVCFs
+
+INPUT
+-----
+GenomicsDB: $GENOMICSDB
+Database size: $DB_SIZE
+Samples: $SAMPLE_COUNT
+Intervals: $INTERVAL_COUNT
+Reference: $REFERENCE
+
+PARAMETERS
+----------
+Ploidy: $PLOIDY
+Min confidence threshold: $MIN_CONFIDENCE
+Heterozygosity: $HETEROZYGOSITY
+Indel heterozygosity: $INDEL_HETEROZYGOSITY
+Max alternate alleles: 6
+Genomicsdb max alternate alleles: 50
+
+OUTPUT
+------
+VCF file: $OUTPUT_VCF
+VCF size: $VCF_SIZE
+Runtime: ${RUNTIME_HOURS}h ${RUNTIME_MIN}m
+
+STATISTICS
+----------
+Total variants: $(printf "%'d" $TOTAL_VARIANTS)
+SNPs: $(printf "%'d" $SNPS)
+Indels: $(printf "%'d" $INDELS)
+SNP/Indel ratio: $(awk "BEGIN {printf \"%.2f\", $SNPS/$INDELS}")
+Ti/Tv ratio: $TITV
+Samples in VCF: $SAMPLES
+
+QUALITY ASSESSMENT
+------------------
+$(if [[ -n "$TITV" ]]; then
+    TITV_FLOAT=$(echo "$TITV" | awk '{print $1}')
+    if (( $(echo "$TITV_FLOAT >= 2.0" | bc -l) )); then
+        echo "✓ EXCELLENT quality (Ti/Tv ≥ 2.0)"
+        echo "  Variants are high quality, ready for analysis"
+    elif (( $(echo "$TITV_FLOAT >= 1.8" | bc -l) )); then
+        echo "✓ GOOD quality (Ti/Tv 1.8-2.0)"
+        echo "  Variants are acceptable for analysis"
+    elif (( $(echo "$TITV_FLOAT >= 1.5" | bc -l) )); then
+        echo "⚠ FAIR quality (Ti/Tv 1.5-1.8)"
+        echo "  Recommend applying quality filters"
+    else
+        echo "⚠ POOR quality (Ti/Tv < 1.5)"
+        echo "  Strong filtering recommended before analysis"
+    fi
+else
+    echo "Unable to assess quality"
+fi)
+
+NEXT STEPS
+----------
+1. Apply variant quality filters using variant_filtration_pipeline.sh
+2. Run quality control metrics using gatk_qc_pipeline.sh
+3. Proceed with GWAS analysis
+
+========================================
+EOF
+
+cat "$SUMMARY"
+
+#===============================================
+# Final Summary
+#===============================================
+echo ""
+echo "=========================================="
+echo "JOINT GENOTYPING COMPLETED SUCCESSFULLY"
+echo "=========================================="
+echo ""
+echo "Output files:"
+echo "  ✓ Raw VCF: $OUTPUT_VCF"
+echo "  ✓ VCF index: ${OUTPUT_VCF}.tbi"
+echo "  ✓ Summary: $SUMMARY"
+echo "  ✓ Log: ${LOG_DIR}/genotype_gvcfs.log"
+echo ""
+echo "Dataset summary:"
+echo "  • $SAMPLES samples"
+echo "  • $(printf "%'d" $TOTAL_VARIANTS) total variants"
+echo "  • Ti/Tv ratio: $TITV"
+echo ""
+echo "Next steps:"
+echo "  1. Apply quality filters: bash variant_filtration_pipeline.sh"
+echo "  2. Run QC metrics: bash gatk_qc_pipeline.sh"
+echo "  3. Proceed with GWAS analysis"
+echo ""
+echo "=========================================="
+
+# Cleanup temp directory
+echo "Cleaning up temporary files..."
+rm -rf "$TMP_DIR"/*
+echo "Cleanup completed"
+echo ""
+
+exit 0
