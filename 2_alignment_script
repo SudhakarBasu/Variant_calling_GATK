@@ -6,7 +6,7 @@
 
 # Configuration
 REFERENCE="references/genome.fa"
-FASTQ_DIR="GWAS/fastq_files"
+FASTQ_DIR="raw_data"
 OUTPUT_DIR="alignment"
 THREADS=32
 LOG_DIR="logs"
